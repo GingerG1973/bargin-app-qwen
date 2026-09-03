@@ -1,0 +1,30 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "bargin"
+version = "0.9.0"
+description = "UK retailer price watcher with glitch detection"
+requires-python = ">=3.10"
+dependencies = [
+    "requests>=2.31.0",
+    "beautifulsoup4>=4.12.0",
+    "lxml>=4.9.0",
+    "feedparser>=6.0.10",
+    "python-dotenv>=1.0.0",
+    "flask>=3.0.0",
+    "anthropic>=0.18.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.4.0",
+]
+
+[project.scripts]
+bargin = "bargin.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["bargin*"]

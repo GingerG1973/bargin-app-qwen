@@ -1,0 +1,13 @@
+README.md
+pyproject.toml
+bargin/__init__.py
+bargin/config.py
+bargin/db.py
+bargin/extractor.py
+bargin/fetcher.py
+bargin.egg-info/PKG-INFO
+bargin.egg-info/SOURCES.txt
+bargin.egg-info/dependency_links.txt
+bargin.egg-info/entry_points.txt
+bargin.egg-info/requires.txt
+bargin.egg-info/top_level.txt

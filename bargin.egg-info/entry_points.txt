@@ -1,0 +1,2 @@
+[console_scripts]
+bargin = bargin.cli:main

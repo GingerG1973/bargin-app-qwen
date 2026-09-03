@@ -1,0 +1,14 @@
+Metadata-Version: 2.4
+Name: bargin
+Version: 0.9.0
+Summary: UK retailer price watcher with glitch detection
+Requires-Python: >=3.10
+Requires-Dist: requests>=2.31.0
+Requires-Dist: beautifulsoup4>=4.12.0
+Requires-Dist: lxml>=4.9.0
+Requires-Dist: feedparser>=6.0.10
+Requires-Dist: python-dotenv>=1.0.0
+Requires-Dist: flask>=3.0.0
+Requires-Dist: anthropic>=0.18.0
+Provides-Extra: dev
+Requires-Dist: pytest>=7.4.0; extra == "dev"

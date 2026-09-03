@@ -1,0 +1,31 @@
+# Sample retailers configuration
+# This file contains search blocks for UK retailers
+
+# Argos:
+#   search_url: "https://www.argos.co.uk/search/{query}"
+#   row_selector: ".ProductCardstyled-sc-1dbefr0-0"
+#   title_selector: "a[data-test='product-title']"
+#   price_selector: "[data-test='price-value']"
+#   link_selector: "a[data-test='product-title']"
+
+# Currys:
+#   search_url: "https://www.currys.co.uk/search?term={query}"
+#   row_selector: ".product"
+#   title_selector: ".product-title a"
+#   price_selector: ".price-current"
+#   link_selector: ".product-title a"
+
+# John Lewis:
+#   search_url: "https://www.johnlewis.com/search?query={query}"
+#   row_selector: ".ProductListingCard"
+#   title_selector: ".ProductListingCard__title"
+#   price_selector: ".ProductListingCard__price"
+#   link_selector: ".ProductListingCard__link"
+
+# Amazon UK:
+#   Note: Amazon has aggressive bot detection. Use with caution.
+#   search_url: "https://www.amazon.co.uk/s?k={query}"
+#   row_selector: "[data-component-type='s-search-result']"
+#   title_selector: "h2 a span"
+#   price_selector: ".a-price-whole"
+#   link_selector: "h2 a"

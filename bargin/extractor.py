@@ -1,8 +1,9 @@
 """Price extraction from HTML using CSS selectors."""
 
 from bs4 import BeautifulSoup
-from typing import Optional, Tuple, List
+from typing import Optional, Tuple, List, Any
 import re
+import json
 
 
 def extract_price(html: str, selector: str) -> Optional[float]:
@@ -11,6 +12,9 @@ def extract_price(html: str, selector: str) -> Optional[float]:
     
     Returns the price as a float (e.g., 29.99) or None if not found.
     """
+    if selector == "__jsonld_product_offer__":
+        return extract_structured_price(html)
+
     soup = BeautifulSoup(html, 'lxml')
     
     elements = soup.select(selector)
@@ -31,6 +35,73 @@ def extract_price(html: str, selector: str) -> Optional[float]:
                     return price
     
     return None
+
+
+def _structured_objects(value: Any) -> List[dict]:
+    """Flatten common JSON-LD graph/list shapes."""
+    if isinstance(value, list):
+        result = []
+        for item in value:
+            result.extend(_structured_objects(item))
+        return result
+    if isinstance(value, dict):
+        result = [value]
+        if isinstance(value.get("@graph"), list):
+            result.extend(_structured_objects(value["@graph"]))
+        return result
+    return []
+
+
+def _offer_price(obj: dict) -> Optional[float]:
+    offers = obj.get("offers")
+    offers = offers if isinstance(offers, list) else [offers]
+    for offer in offers:
+        if not isinstance(offer, dict):
+            continue
+        price = offer.get("price") or offer.get("lowPrice")
+        if price is not None:
+            try:
+                return float(str(price).replace(",", ""))
+            except ValueError:
+                continue
+    return None
+
+
+def extract_structured_price(html: str) -> Optional[float]:
+    """Extract the price from a single Schema.org Product JSON-LD object."""
+    soup = BeautifulSoup(html, 'lxml')
+    products = []
+    for script in soup.select('script[type="application/ld+json"]'):
+        try:
+            data = json.loads(script.string or script.get_text())
+        except (TypeError, ValueError, json.JSONDecodeError):
+            continue
+        for obj in _structured_objects(data):
+            types = obj.get("@type", [])
+            types = types if isinstance(types, list) else [types]
+            if "Product" in types and _offer_price(obj) is not None:
+                products.append(obj)
+
+    # A list/category page can contain many products and has no single price.
+    if len(products) != 1:
+        return None
+    return _offer_price(products[0])
+
+
+def is_collection_page(html: str) -> bool:
+    """Return whether structured data identifies a multi-product page."""
+    soup = BeautifulSoup(html, 'lxml')
+    for script in soup.select('script[type="application/ld+json"]'):
+        try:
+            data = json.loads(script.string or script.get_text())
+        except (TypeError, ValueError, json.JSONDecodeError):
+            continue
+        for obj in _structured_objects(data):
+            types = obj.get("@type", [])
+            types = types if isinstance(types, list) else [types]
+            if "CollectionPage" in types or "ItemList" in types:
+                return True
+    return False
 
 
 def _parse_price(text: str) -> Optional[float]:
@@ -143,11 +214,16 @@ def find_price_selectors(html: str) -> List[str]:
     """
     soup = BeautifulSoup(html, 'lxml')
     candidates = []
+
+    if extract_structured_price(html) is not None:
+        candidates.append("__jsonld_product_offer__")
+    elif is_collection_page(html):
+        return []
     
     # Look for elements with price-like content
-    for el in soup.find_all(['span', 'div', 'p', 'strong']):
+    for el in soup.find_all(['span', 'p', 'strong']):
         text = el.get_text(strip=True)
-        if _parse_price(text) is not None:
+        if _parse_price(text) is not None and len(text) <= 80:
             # Build a selector for this element
             selector = _build_selector(el)
             if selector:
@@ -163,7 +239,13 @@ def find_price_selectors(html: str) -> List[str]:
         if soup.select_one(selector):
             candidates.append(selector)
     
-    return candidates[:10]  # Limit candidates
+    # Prefer explicit price classes over generic selectors.
+    candidates.sort(key=lambda selector: (
+        0 if selector == "__jsonld_product_offer__" else 1,
+        0 if "price" in selector.lower() else 1,
+        len(selector),
+    ))
+    return list(dict.fromkeys(candidates))[:10]
 
 
 def _build_selector(el) -> Optional[str]:

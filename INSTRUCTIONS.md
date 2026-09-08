@@ -42,6 +42,10 @@ matters works. Everything else is optional.
 
 ## 2. Credentials
 
+The app is configured for the UK by default: product prices are GBP (£),
+dates use `en-GB`/`Europe-London`, and eBay searches use the GB marketplace.
+Anthropic and ZenRows provider costs remain in USD or credits respectively.
+
 Every one of these is optional. The app degrades rather than breaks.
 
 | Setting | Unlocks | Without it |
@@ -87,7 +91,7 @@ checked, a real eBay search, every feed and tracked page fetched. Run
 bargin serve
 ```
 
-Then <http://127.0.0.1:8787>. On iPhone, open that URL in Safari and
+Then <http://127.0.0.1:8500>. On iPhone, open that URL in Safari and
 **Share → Add to Home Screen** — it's already a standalone PWA.
 
 | Tab | What it's for |
@@ -132,10 +136,12 @@ post Claude triages as a lead pushes to your phone, capped at five per sweep.
 | `bargin run --force` | Check everything now |
 | `bargin watch` | Run continuously in the foreground |
 | `bargin list` | Dashboard in the terminal |
-| `bargin serve` | Web UI + JSON API on :8787 |
+| `bargin serve` | Web UI + JSON API on :8500 |
 | `bargin history <product_id>` | Price history, `--days 90` |
 | `bargin doctor` | Is it configured? |
 | `bargin preflight --push` | Does it actually work? |
+| `bargin zenrows-status` | Show today's paid-fetch usage |
+| `bargin llm-status` | Show today's Claude budget usage |
 | `bargin notify-test` | Send one test push |
 | `bargin social` | Poll the deal feeds now. `--triage` to have Claude read them. |
 | `bargin social-add r/UKDeals` | Add a feed |
@@ -154,7 +160,8 @@ post Claude triages as a lead pushes to your phone, capped at five per sweep.
 ```
 
 Installs a launchd agent that runs `bargin run` every 15 minutes. That single
-sweep covers price checks, feed polling and alerts — nothing else to schedule.
+The product sweep and feed polling are separate operations; schedule the feed
+poll explicitly if you want social leads updated unattended.
 
 ```bash
 launchctl kickstart -k gui/$(id -u)/com.bargin.watcher   # run now
@@ -190,7 +197,7 @@ shasum -a 256 bargin/web/index.html | cut -c1-7
 
 Same → you're seeing current code, look elsewhere. Different → either the
 process is stale (restart `serve`) or you have a non-editable install. Check
-`ui_path` in <http://127.0.0.1:8787/api/health>: if it isn't inside your
+`ui_path` in <http://127.0.0.1:8500/api/health>: if it isn't inside your
 checkout, run `pip uninstall bargin && pip install -e .`.
 
 ### "A product stopped updating"

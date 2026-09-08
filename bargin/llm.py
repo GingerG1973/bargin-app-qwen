@@ -1,6 +1,8 @@
 """LLM client for Claude-powered features."""
 
 import json
+import time
+import hashlib
 from typing import Optional, Dict, Any, List
 from datetime import datetime
 
@@ -13,8 +15,12 @@ except ImportError:
 class LLMClient:
     """Client for Anthropic Claude API."""
     
-    MODEL = "claude-sonnet-4-20250514"
-    
+MODEL_PRICING = {
+    "claude-sonnet-4-20250514": {"input": 3.0, "output": 15.0},
+    "claude-haiku-4-5-20251001": {"input": 0.25, "output": 1.25},
+    "claude-opus-4-20250514": {"input": 15.0, "output": 75.0},
+}
+
     def __init__(self, api_key: str, db_path: Optional[str] = None):
         if not anthropic:
             raise ImportError("anthropic package not installed")
@@ -22,7 +28,84 @@ class LLMClient:
         self.api_key = api_key
         self.db_path = db_path
         self.client = anthropic.Anthropic(api_key=api_key)
-        self.model = self.MODEL
+        try:
+            from bargin.config import Config
+            config = Config.load()
+            self.model = config.llm_model
+            self.simple_model = config.llm_simple_model
+            self.daily_budget_usd = config.llm_daily_budget_usd
+            self.enabled = config.llm_enabled
+            self.llm_pricing_overrides = config.llm_pricing_overrides
+        except Exception:
+            self.model = self.MODEL
+            self.simple_model = self.MODEL
+            self.daily_budget_usd = 1.0
+            self.enabled = True
+            self.llm_pricing_overrides = {}
+
+    def _get_model_pricing(self, model: str) -> Dict[str, float]:
+        """Get pricing for a model, with override support."""
+        base = MODEL_PRICING.get(model)
+        if not base:
+            return {"input": 3.0, "output": 15.0}
+        
+        result = base.copy()
+        if model in self.llm_pricing_overrides:
+            result.update(self.llm_pricing_overrides[model])
+        return result
+
+    def _call(self, capability: str, max_tokens: int, messages: List[Dict[str, str]],
+              request_data: Optional[Dict] = None, simple: bool = False) -> Any:
+        """Make a budgeted Anthropic call and reconcile its actual cost."""
+        if not self.enabled:
+            raise RuntimeError("LLM is disabled")
+        model = self.simple_model if simple else self.model
+        prompt_chars = sum(len(message.get("content", "")) for message in messages)
+        input_tokens_estimate = max(1, prompt_chars // 4)
+        
+        pricing = self._get_model_pricing(model)
+        
+        estimated = (input_tokens_estimate * pricing["input"] + max_tokens * pricing["output"]) / 1_000_000
+        call_id = None
+        if self.db_path:
+            from bargin.db import reserve_llm_budget
+            call_id, reason = reserve_llm_budget(
+                self.db_path, capability, model, estimated, self.daily_budget_usd
+            )
+            if call_id is None:
+                raise RuntimeError(reason)
+        started = time.monotonic()
+        try:
+            response = self.client.messages.create(
+                model=model, max_tokens=max_tokens, messages=messages
+            )
+            usage = getattr(response, "usage", None)
+            input_tokens = getattr(usage, "input_tokens", 0) if usage else 0
+            output_tokens = getattr(usage, "output_tokens", 0) if usage else 0
+            cost = (input_tokens * pricing["input"] + output_tokens * pricing["output"]) / 1_000_000
+            if self.db_path and call_id:
+                from bargin.db import finish_llm_call
+                finish_llm_call(
+                    self.db_path, call_id, "success", input_tokens, output_tokens,
+                    cost, latency_ms=int((time.monotonic() - started) * 1000),
+                    response_data={"text": self._response_text(response)[:2000]},
+                )
+            return response
+        except Exception as exc:
+            if self.db_path and call_id:
+                from bargin.db import finish_llm_call
+                status = "timeout" if isinstance(exc, TimeoutError) else "error"
+                finish_llm_call(
+                    self.db_path, call_id, status,
+                    error=str(exc)[:500], latency_ms=int((time.monotonic() - started) * 1000),
+                )
+            raise
+
+    @staticmethod
+    def _response_text(response: Any) -> str:
+        if hasattr(response, "content") and response.content:
+            return getattr(response.content[0], "text", str(response.content[0]))
+        return getattr(response, "text", str(response))
     
     def _record_call(
         self,
@@ -33,33 +116,24 @@ class LLMClient:
         """Record LLM call for cost tracking."""
         if not self.db_path:
             return
-        
         try:
             from bargin.db import record_llm_call
+            usage = getattr(response, "usage", None)
+            input_tokens = getattr(usage, "input_tokens", 0) if usage else 0
+            output_tokens = getattr(usage, "output_tokens", 0) if usage else 0
             
-            input_tokens = getattr(response, 'usage', None)
-            output_tokens = getattr(response, 'usage', None)
-            cost_usd = 0.0
-            
-            # Calculate approximate cost (Sonnet pricing)
-            if input_tokens and hasattr(input_tokens, 'input_tokens'):
-                input_tokens = input_tokens.input_tokens
-                output_tokens = input_tokens.output_tokens if hasattr(input_tokens, 'output_tokens') else 0
-                # Approximate: $3/1M input, $15/1M output
-                cost_usd = (input_tokens * 3 + output_tokens * 15) / 1_000_000
+            pricing = self._get_model_pricing(self.model)
+            cost_usd = (input_tokens * pricing["input"] + output_tokens * pricing["output"]) / 1_000_000
             
             record_llm_call(
-                self.db_path,
-                capability=capability,
-                model=self.model,
-                input_tokens=input_tokens or 0,
-                output_tokens=output_tokens or 0,
+                self.db_path, capability=capability, model=self.model,
+                input_tokens=input_tokens, output_tokens=output_tokens,
                 cost_usd=cost_usd,
                 request_data=request_data,
-                response_data={"text": response.text[:2000] if hasattr(response, 'text') else str(response)[:2000]}
+                response_data={"text": self._response_text(response)[:2000]},
             )
         except Exception:
-            pass  # Don't fail on logging
+            pass
     
     def extract_selector_from_html(self, html: str, url: str) -> Optional[str]:
         """
@@ -68,6 +142,22 @@ class LLMClient:
         This is the selector repair capability - when our existing selector
         stops working, Claude analyzes the page structure to find a new one.
         """
+        content_hash = hashlib.sha256(html[:3000].encode()).hexdigest()[:16]
+        cache_key = f"{url}:{content_hash}"
+        url_cache_key = f"{url}:{content_hash}"
+        if self.db_path:
+            from bargin.db import get_llm_cache
+            cached = get_llm_cache(self.db_path, "selector_repair", cache_key)
+            if cached is not None:
+                return cached or None
+            # Do not re-analyze a URL more than once per cooldown window when
+            # the page changed but the retailer is still failing extraction.
+            url_cached = get_llm_cache(
+                self.db_path, "selector_repair_url", url_cache_key, max_age_hours=6
+            )
+            if url_cached is not None:
+                return url_cached or None
+
         prompt = f"""Analyze this HTML and find the CSS selector that would select the product price.
 Look for patterns like £XX.XX or currency symbols with numbers.
 
@@ -79,19 +169,23 @@ HTML snippet:
 CSS selector:"""
         
         try:
-            response = self.client.messages.create(
-                model=self.model,
-                max_tokens=100,
-                messages=[{"role": "user", "content": prompt}]
+            response = self._call(
+                "selector_repair", 100,
+                [{"role": "user", "content": prompt}], {"url": url}
             )
-            
-            self._record_call("selector_repair", response, {"url": url})
             
             selector = response.content[0].text.strip() if hasattr(response, 'content') else response.text.strip()
             
             if selector.upper() == "NONE":
+                if self.db_path:
+                    from bargin.db import set_llm_cache
+                    set_llm_cache(self.db_path, "selector_repair", cache_key, "")
+                    set_llm_cache(self.db_path, "selector_repair_url", url_cache_key, "")
                 return None
-            
+            if self.db_path:
+                from bargin.db import set_llm_cache
+                set_llm_cache(self.db_path, "selector_repair", cache_key, selector)
+                set_llm_cache(self.db_path, "selector_repair_url", url_cache_key, selector)
             return selector
         except Exception as e:
             return None
@@ -120,13 +214,10 @@ Summary: {summary[:500]}
 Analysis:"""
         
         try:
-            response = self.client.messages.create(
-                model=self.model,
-                max_tokens=200,
-                messages=[{"role": "user", "content": prompt}]
+            response = self._call(
+                "triage", 200,
+                [{"role": "user", "content": prompt}], {"title": title}, simple=True
             )
-            
-            self._record_call("triage", response, {"title": title})
             
             text = response.content[0].text if hasattr(response, 'content') else response.text
             
@@ -174,17 +265,11 @@ Respond in JSON:
 Analysis:"""
         
         try:
-            response = self.client.messages.create(
-                model=self.model,
-                max_tokens=200,
-                messages=[{"role": "user", "content": prompt}]
+            response = self._call(
+                "glitch_detection", 200,
+                [{"role": "user", "content": prompt}],
+                {"product": product_title, "price": price}, simple=True
             )
-            
-            self._record_call("glitch_detection", response, {
-                "product": product_title,
-                "price": price,
-                "drop_pct": drop_pct
-            })
             
             text = response.content[0].text if hasattr(response, 'content') else response.text
             
@@ -210,6 +295,12 @@ Analysis:"""
     
     def normalize_product_title(self, title: str) -> str:
         """Clean up and normalize a product title for matching."""
+        cache_key = hashlib.sha256(title.strip().encode()).hexdigest()
+        if self.db_path:
+            from bargin.db import get_llm_cache
+            cached = get_llm_cache(self.db_path, "normalize_title", cache_key)
+            if cached is not None:
+                return cached
         prompt = f"""Normalize this product title by removing marketing fluff.
 Keep only the essential product information (brand, model, key specs).
 Remove words like "New", "Sale", "Best Price", etc.
@@ -219,15 +310,16 @@ Title: {title}
 Normalized:"""
         
         try:
-            response = self.client.messages.create(
-                model=self.model,
-                max_tokens=100,
-                messages=[{"role": "user", "content": prompt}]
+            response = self._call(
+                "normalize_title", 100,
+                [{"role": "user", "content": prompt}], {"title": title}, simple=True
             )
             
-            self._record_call("normalize_title", response, {"title": title})
-            
-            return response.content[0].text.strip() if hasattr(response, 'content') else response.text.strip()
+            result = response.content[0].text.strip() if hasattr(response, 'content') else response.text.strip()
+            if self.db_path:
+                from bargin.db import set_llm_cache
+                set_llm_cache(self.db_path, "normalize_title", cache_key, result)
+            return result
         except Exception:
             return title
     
@@ -241,13 +333,10 @@ HTML: {html[:4000]}
 JSON:"""
         
         try:
-            response = self.client.messages.create(
-                model=self.model,
-                max_tokens=300,
-                messages=[{"role": "user", "content": prompt}]
+            response = self._call(
+                "extract_info", 300,
+                [{"role": "user", "content": prompt}]
             )
-            
-            self._record_call("extract_info", response)
             
             text = response.content[0].text if hasattr(response, 'content') else response.text
             
@@ -273,16 +362,10 @@ Respond in JSON:
 Analysis:"""
         
         try:
-            response = self.client.messages.create(
-                model=self.model,
-                max_tokens=200,
-                messages=[{"role": "user", "content": prompt}]
+            response = self._call(
+                "compare_products", 200,
+                [{"role": "user", "content": prompt}], simple=True
             )
-            
-            self._record_call("compare_products", response, {
-                "title1": title1[:200],
-                "title2": title2[:200]
-            })
             
             text = response.content[0].text if hasattr(response, 'content') else response.text
             
@@ -311,13 +394,10 @@ Product: {product_title}
 Search query:"""
         
         try:
-            response = self.client.messages.create(
-                model=self.model,
-                max_tokens=60,
-                messages=[{"role": "user", "content": prompt}]
+            response = self._call(
+                "search_query", 60,
+                [{"role": "user", "content": prompt}], simple=True
             )
-            
-            self._record_call("search_query", response, {"title": product_title})
             
             return response.content[0].text.strip() if hasattr(response, 'content') else response.text.strip()
         except Exception:
@@ -339,13 +419,10 @@ Respond in JSON:
 Analysis:"""
         
         try:
-            response = self.client.messages.create(
-                model=self.model,
-                max_tokens=200,
-                messages=[{"role": "user", "content": prompt}]
+            response = self._call(
+                "price_trend", 200,
+                [{"role": "user", "content": prompt}], simple=True
             )
-            
-            self._record_call("price_trend", response, {"prices": prices[-10:]})
             
             text = response.content[0].text if hasattr(response, 'content') else response.text
             
@@ -390,16 +467,10 @@ Return JSON:
 Configuration:"""
         
         try:
-            response = self.client.messages.create(
-                model=self.model,
-                max_tokens=400,
-                messages=[{"role": "user", "content": prompt}]
+            response = self._call(
+                "write_search_block", 400,
+                [{"role": "user", "content": prompt}]
             )
-            
-            self._record_call("write_search_block", response, {
-                "retailer": retailer,
-                "query": query
-            })
             
             text = response.content[0].text if hasattr(response, 'content') else response.text
             

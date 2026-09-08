@@ -13,7 +13,7 @@ cp .env.example .env
 bargin serve
 ```
 
-Then open <http://127.0.0.1:8787>.
+Then open <http://127.0.0.1:8500>.
 
 See [INSTRUCTIONS.md](INSTRUCTIONS.md) for full documentation.
 
@@ -29,6 +29,10 @@ See [INSTRUCTIONS.md](INSTRUCTIONS.md) for full documentation.
 ## Configuration
 
 All settings in `.env`:
+
+Product prices use **GBP (£)**, UK dates use `en-GB` with the
+`Europe/London` timezone, and eBay searches use the `EBAY_GB` marketplace.
+Anthropic usage is billed and displayed separately in **USD ($)**.
 
 | Setting | Purpose |
 |---|---|
@@ -46,9 +50,11 @@ All settings in `.env`:
 | `bargin run --force` | Check everything now |
 | `bargin watch` | Run continuously in the foreground |
 | `bargin list` | Dashboard in the terminal |
-| `bargin serve` | Web UI + JSON API on :8787 |
+| `bargin serve` | Web UI + JSON API on :8500 |
 | `bargin doctor` | Is it configured? |
 | `bargin preflight --push` | Does it actually work? |
+| `bargin zenrows-status` | Show today's paid-fetch usage |
+| `bargin llm-status` | Show today's Claude budget usage |
 
 ## Architecture
 

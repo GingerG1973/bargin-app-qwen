@@ -1,10 +1,12 @@
 """eBay search integration."""
 
 import requests
+import base64
 from typing import List, Dict, Any
 
 
-def ebay_search(query: str, client_id: str, client_secret: str) -> List[Dict[str, Any]]:
+def ebay_search(query: str, client_id: str, client_secret: str,
+                marketplace: str = "EBAY_GB") -> List[Dict[str, Any]]:
     """
     Search eBay for products.
     
@@ -15,7 +17,9 @@ def ebay_search(query: str, client_id: str, client_secret: str) -> List[Dict[str
     
     headers = {
         "Content-Type": "application/x-www-form-urlencoded",
-        "Authorization": f"Basic {requests.utils._basic_auth_str(client_id, client_secret)}"
+        "Authorization": "Basic " + base64.b64encode(
+            f"{client_id}:{client_secret}".encode("utf-8")
+        ).decode("ascii")
     }
     
     data = {
@@ -37,7 +41,7 @@ def ebay_search(query: str, client_id: str, client_secret: str) -> List[Dict[str
     
     search_headers = {
         "Authorization": f"Bearer {access_token}",
-        "X-EBAY-C-MARKETPLACE-ID": "EBAY_GB",  # UK marketplace
+        "X-EBAY-C-MARKETPLACE-ID": marketplace,
         "Accept": "application/json"
     }
     

@@ -1,5 +1,5 @@
 <!DOCTYPE html>
-<html lang="en">
+<html lang="en-GB">
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
@@ -8,7 +8,7 @@
     <meta name="theme-color" content="#6366f1">
     <meta name="apple-mobile-web-app-capable" content="yes">
     <meta name="apple-mobile-web-app-status-bar-style" content="default">
-    <meta name="apple-mobile-web-app-title" content="Bargin">
+    <meta name="apple-mobile-web-app-title" content="Bargin UK">
     <style>
         :root {
             --primary: #6366f1;
@@ -218,8 +218,14 @@
             <div class="card">
                 <h2>Track a Product</h2>
                 <div class="form-row">
-                    <input type="url" id="track-url" placeholder="Paste product URL here...">
+                    <input type="text" id="track-title" placeholder="Name (optional — detected from page)">
+                    <input type="url" id="track-url" placeholder="Product URL or search route...">
+                </div>
+                <div class="form-row">
                     <input type="number" id="target-price" placeholder="Target £" step="0.01" style="width: 120px;">
+                    <label><input type="checkbox" id="use-llm" style="width:auto; margin-right:.25rem;"> Use Claude</label>
+                    <label><input type="checkbox" id="use-zenrows" style="width:auto; margin-right:.25rem;"> Use ZenRows</label>
+                    <label><input type="checkbox" id="poll-now" checked style="width:auto; margin-right:.25rem;"> Poll now</label>
                     <button class="primary" onclick="trackProduct()">Track</button>
                 </div>
             </div>
@@ -344,11 +350,12 @@
                     
                     html += `<tr>
                         <td>${escapeHtml(p.title.substring(0, 40))}</td>
-                        <td>${escapeHtml(u.retailer)}</td>
+                        <td>${escapeHtml(u.retailer)}<br><small>${escapeHtml(u.url)}</small></td>
                         <td>${price}</td>
                         <td>${status}${u.glitch_watch ? ' <span class="badge badge-glitch">Fast</span>' : ''}</td>
                         <td>
                             <button class="danger" onclick="deleteProduct(${p.id})">Delete</button>
+                            <button onclick="editProduct(${p.id}, ${JSON.stringify(p.title)}, ${JSON.stringify(u.url)})">Edit</button>
                             <button onclick="toggleGlitch(${u.id}, ${!u.glitch_watch})">${u.glitch_watch ? 'Slow' : 'Fast'}</button>
                         </td>
                     </tr>`;
@@ -360,8 +367,12 @@
         }
         
         async function trackProduct() {
+            const title = document.getElementById('track-title').value;
             const url = document.getElementById('track-url').value;
             const targetPrice = document.getElementById('target-price').value;
+            const useLlm = document.getElementById('use-llm').checked;
+            const useZenRows = document.getElementById('use-zenrows').checked;
+            const pollNow = document.getElementById('poll-now').checked;
             
             if (!url) { alert('Please enter a URL'); return; }
             
@@ -369,8 +380,12 @@
                 method: 'POST',
                 headers: {'Content-Type': 'application/json'},
                 body: JSON.stringify({
+                    title: title || null,
                     url: url,
-                    target_price: targetPrice ? parseFloat(targetPrice) : null
+                    target_price: targetPrice ? parseFloat(targetPrice) : null,
+                    use_llm: useLlm,
+                    use_zenrows: useZenRows,
+                    poll_now: pollNow
                 })
             });
             
@@ -378,12 +393,28 @@
             
             if (res.ok) {
                 alert(`Added: ${result.title}`);
+                document.getElementById('track-title').value = '';
                 document.getElementById('track-url').value = '';
                 document.getElementById('target-price').value = '';
                 loadProducts();
             } else {
                 alert(`Error: ${result.error}`);
             }
+        }
+
+        async function editProduct(id, currentTitle, currentUrl) {
+            const title = prompt('Product name:', currentTitle);
+            if (title === null) return;
+            const url = prompt('Tracked URL / search route:', currentUrl);
+            if (url === null) return;
+            const res = await fetch(`/api/products/${id}`, {
+                method: 'PUT',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({title, url})
+            });
+            const result = await res.json();
+            if (!res.ok) alert(`Error: ${result.error}`);
+            loadProducts();
         }
         
         async function deleteProduct(id) {
@@ -423,7 +454,7 @@
                     <td>${typeBadge}</td>
                     <td>${escapeHtml(a.title.substring(0, 40))}</td>
                     <td>${escapeHtml(a.message || '')}</td>
-                    <td>${new Date(a.created_at).toLocaleDateString()}</td>
+                    <td>${formatUkDate(a.created_at)}</td>
                 </tr>`;
             });
             
@@ -486,7 +517,7 @@
                 html += `<li style="padding: 0.75rem 0; border-bottom: 1px solid var(--border);">
                     <strong>${escapeHtml(i.title.substring(0, 60))}</strong>
                     <div style="font-size: 0.75rem; color: var(--text-muted); margin-top: 0.25rem;">
-                        ${i.feed_name} · ${new Date(i.created_at).toLocaleDateString()}
+                        ${i.feed_name} · ${formatUkDate(i.created_at)}
                     </div>
                 </li>`;
             });
@@ -505,7 +536,7 @@
                 html += `<tr>
                     <td>${escapeHtml(a.event_type)}</td>
                     <td>${escapeHtml((a.details || '').substring(0, 50))}</td>
-                    <td>${new Date(a.created_at).toLocaleString()}</td>
+                    <td>${formatUkDateTime(a.created_at)}</td>
                 </tr>`;
             });
             
@@ -522,7 +553,7 @@
                 <div class="config-grid">
                     <div class="config-item">
                         <label>Total Cost</label>
-                        <div class="value">$${(costs.total_cost || 0).toFixed(4)}</div>
+                        <div class="value">$${(costs.total_cost || 0).toFixed(4)} USD</div>
                     </div>
                     <div class="config-item">
                         <label>API Calls</label>
@@ -535,6 +566,26 @@
                     <div class="config-item">
                         <label>Output Tokens</label>
                         <div class="value">${(costs.total_output_tokens || 0).toLocaleString()}</div>
+                    </div>
+                    <div class="config-item">
+                        <label>LLM Spent Today</label>
+                        <div class="value">$${(costs.llm_budget?.spent || 0).toFixed(4)} USD</div>
+                    </div>
+                    <div class="config-item">
+                        <label>LLM Remaining Today</label>
+                        <div class="value">${costs.llm_budget?.budget > 0 ? '$' + (costs.llm_budget.remaining || 0).toFixed(4) + ' USD' : 'Unlimited'}</div>
+                    </div>
+                    <div class="config-item">
+                        <label>LLM Blocked Calls</label>
+                        <div class="value">${costs.llm_budget?.blocked || 0}</div>
+                    </div>
+                    <div class="config-item">
+                        <label>ZenRows Credits</label>
+                        <div class="value">${costs.zenrows?.credits || 0} / ${costs.zenrows?.daily_limit || 0}</div>
+                    </div>
+                    <div class="config-item">
+                        <label>ZenRows Remaining Today</label>
+                        <div class="value">${costs.zenrows?.remaining || 0}</div>
                     </div>
                 </div>
             `;
@@ -613,7 +664,7 @@
                 html += `<div style="padding: 0.75rem 0; border-bottom: 1px solid var(--border);">
                     <strong>${escapeHtml(r.title?.substring(0, 60) || 'Unknown')}</strong>
                     <div style="font-size: 0.875rem; color: var(--text-muted);">
-                        £${r.price || '?'} · ${escapeHtml(r.retailer || 'Unknown retailer')}
+                        ${formatPrice(r.price, r.currency)} · ${escapeHtml(r.retailer || 'Unknown retailer')}
                     </div>
                     <a href="${escapeHtml(r.link || '#')}" target="_blank" style="font-size: 0.75rem; color: var(--primary);">View →</a>
                 </div>`;
@@ -627,6 +678,25 @@
             const div = document.createElement('div');
             div.textContent = text;
             return div.innerHTML;
+        }
+
+        const ukDateFormatter = new Intl.DateTimeFormat('en-GB', {
+            timeZone: 'Europe/London', day: '2-digit', month: '2-digit', year: 'numeric'
+        });
+        const ukDateTimeFormatter = new Intl.DateTimeFormat('en-GB', {
+            timeZone: 'Europe/London', dateStyle: 'short', timeStyle: 'short'
+        });
+        function formatUkDate(value) {
+            return value ? ukDateFormatter.format(new Date(value)) : '-';
+        }
+        function formatUkDateTime(value) {
+            return value ? ukDateTimeFormatter.format(new Date(value)) : '-';
+        }
+        function formatPrice(value, currency = 'GBP') {
+            if (value === null || value === undefined || value === '') return '?';
+            return new Intl.NumberFormat('en-GB', {
+                style: 'currency', currency: currency || 'GBP'
+            }).format(Number(value));
         }
         
         // Initial load

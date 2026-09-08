@@ -5,6 +5,32 @@ from datetime import datetime, timedelta
 from typing import Optional, List, Dict, Any
 from contextlib import contextmanager
 import json
+from urllib.parse import urlsplit, urlunsplit, parse_qsl, urlencode
+
+
+def normalize_url(url: str) -> str:
+    """Normalize harmless URL differences for duplicate detection."""
+    parts = urlsplit(url.strip())
+    query = urlencode([
+        (key, value) for key, value in parse_qsl(parts.query, keep_blank_values=True)
+        if not key.lower().startswith(("utm_", "fbclid", "gclid"))
+    ])
+    path = parts.path.rstrip("/") or "/"
+    return urlunsplit((parts.scheme.lower(), parts.netloc.lower(), path, query, ""))
+
+
+def find_product_by_url(db_path: str, url: str) -> Optional[Dict[str, Any]]:
+    """Find an existing product URL using normalized URL comparison."""
+    wanted = normalize_url(url)
+    with get_connection(db_path) as conn:
+        rows = conn.execute("""
+            SELECT p.id AS product_id, p.title, pu.id AS url_id, pu.url
+            FROM products p JOIN product_urls pu ON pu.product_id = p.id
+        """).fetchall()
+    for row in rows:
+        if normalize_url(row["url"]) == wanted:
+            return dict(row)
+    return None
 
 
 @contextmanager
@@ -12,6 +38,7 @@ def get_connection(db_path: str):
     """Get a database connection with row factory."""
     conn = sqlite3.connect(db_path)
     conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA foreign_keys = ON")
     try:
         yield conn
     finally:
@@ -38,6 +65,7 @@ def init_db(db_path: str) -> None:
                 retailer TEXT NOT NULL,
                 selector TEXT,
                 target_price REAL,
+                use_zenrows BOOLEAN DEFAULT FALSE,
                 glitch_watch BOOLEAN DEFAULT FALSE,
                 last_checked TIMESTAMP,
                 last_price REAL,
@@ -70,6 +98,16 @@ def init_db(db_path: str) -> None:
                 sent_push BOOLEAN DEFAULT FALSE,
                 read BOOLEAN DEFAULT FALSE,
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY (product_url_id) REFERENCES product_urls(id) ON DELETE CASCADE
+            );
+
+            -- Tracks whether a threshold condition is currently active.
+            CREATE TABLE IF NOT EXISTS alert_conditions (
+                product_url_id INTEGER NOT NULL,
+                alert_type TEXT NOT NULL,
+                active BOOLEAN DEFAULT FALSE,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                PRIMARY KEY (product_url_id, alert_type),
                 FOREIGN KEY (product_url_id) REFERENCES product_urls(id) ON DELETE CASCADE
             );
             
@@ -111,6 +149,18 @@ def init_db(db_path: str) -> None:
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             );
             
+            -- Task tracking for async API
+            CREATE TABLE IF NOT EXISTS tasks (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                action TEXT NOT NULL,
+                status TEXT NOT NULL,
+                started_at TIMESTAMP NOT NULL,
+                finished_at TIMESTAMP,
+                result_json TEXT,
+                error TEXT,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            );
+            
             -- LLM cost tracking
             CREATE TABLE IF NOT EXISTS llm_calls (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -119,9 +169,22 @@ def init_db(db_path: str) -> None:
                 input_tokens INTEGER,
                 output_tokens INTEGER,
                 cost_usd REAL,
+                estimated_cost_usd REAL DEFAULT 0,
+                reserved_cost_usd REAL DEFAULT 0,
+                status TEXT DEFAULT 'success',
+                error TEXT,
+                latency_ms INTEGER,
                 request_data TEXT,
                 response_data TEXT,
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            );
+
+            CREATE TABLE IF NOT EXISTS llm_cache (
+                capability TEXT NOT NULL,
+                cache_key TEXT NOT NULL,
+                result TEXT,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                PRIMARY KEY (capability, cache_key)
             );
             
             -- ZenRows usage tracking
@@ -129,6 +192,8 @@ def init_db(db_path: str) -> None:
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 url TEXT NOT NULL,
                 success BOOLEAN,
+                status_code INTEGER,
+                reason TEXT,
                 cost_credits INTEGER DEFAULT 1,
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             );
@@ -152,12 +217,190 @@ def init_db(db_path: str) -> None:
             CREATE INDEX IF NOT EXISTS idx_feed_items_created_at ON feed_items(created_at);
             CREATE INDEX IF NOT EXISTS idx_activity_log_created_at ON activity_log(created_at);
             CREATE INDEX IF NOT EXISTS idx_llm_calls_created_at ON llm_calls(created_at);
+            CREATE INDEX IF NOT EXISTS idx_zenrows_usage_created_at ON zenrows_usage(created_at);
+            CREATE INDEX IF NOT EXISTS idx_zenrows_usage_url ON zenrows_usage(url);
         """)
+        columns = {row["name"] for row in conn.execute("PRAGMA table_info(product_urls)")}
+        if "use_zenrows" not in columns:
+            conn.execute("ALTER TABLE product_urls ADD COLUMN use_zenrows BOOLEAN DEFAULT FALSE")
+        usage_columns = {row["name"] for row in conn.execute("PRAGMA table_info(zenrows_usage)")}
+        if "status_code" not in usage_columns:
+            conn.execute("ALTER TABLE zenrows_usage ADD COLUMN status_code INTEGER")
+        if "reason" not in usage_columns:
+            conn.execute("ALTER TABLE zenrows_usage ADD COLUMN reason TEXT")
+        llm_columns = {row["name"] for row in conn.execute("PRAGMA table_info(llm_calls)")}
+        for column, definition in {
+            "estimated_cost_usd": "REAL DEFAULT 0",
+            "reserved_cost_usd": "REAL DEFAULT 0",
+            "status": "TEXT DEFAULT 'success'",
+            "error": "TEXT",
+            "latency_ms": "INTEGER",
+        }.items():
+            if column not in llm_columns:
+                conn.execute(f"ALTER TABLE llm_calls ADD COLUMN {column} {definition}")
         conn.commit()
 
 
+def reserve_llm_budget(db_path: str, capability: str, model: str,
+                       estimated_cost_usd: float, daily_budget_usd: float) -> tuple[Optional[int], str]:
+    """Reserve estimated LLM spend before making a remote call."""
+    with get_connection(db_path) as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        if daily_budget_usd > 0:
+            used = conn.execute("""
+                SELECT COALESCE(SUM(CASE WHEN status = 'reserved'
+                    THEN reserved_cost_usd ELSE cost_usd END), 0) AS used
+                FROM llm_calls WHERE date(created_at) = date('now')
+            """).fetchone()["used"]
+            if used + estimated_cost_usd > daily_budget_usd:
+                conn.execute("""
+                    INSERT INTO llm_calls (capability, model, cost_usd,
+                        estimated_cost_usd, reserved_cost_usd, status, error)
+                    VALUES (?, ?, 0, ?, 0, 'blocked', ?)
+                """, (capability, model, estimated_cost_usd, "daily budget reached"))
+                conn.commit()
+                return None, "daily LLM budget reached"
+        cursor = conn.execute("""
+            INSERT INTO llm_calls (capability, model, cost_usd,
+                estimated_cost_usd, reserved_cost_usd, status)
+            VALUES (?, ?, 0, ?, ?, 'reserved')
+        """, (capability, model, estimated_cost_usd, estimated_cost_usd))
+        conn.commit()
+        return cursor.lastrowid, "reserved"
+
+
+def get_llm_cache(db_path: str, capability: str, cache_key: str,
+                  max_age_hours: Optional[int] = None) -> Optional[str]:
+    """Return a cached LLM result for an identical input."""
+    with get_connection(db_path) as conn:
+        if max_age_hours is None:
+            row = conn.execute(
+                "SELECT result FROM llm_cache WHERE capability = ? AND cache_key = ?",
+                (capability, cache_key),
+            ).fetchone()
+        else:
+            row = conn.execute(
+                "SELECT result FROM llm_cache WHERE capability = ? AND cache_key = ? "
+                "AND created_at >= datetime('now', ?)",
+                (capability, cache_key, f"-{max_age_hours} hours"),
+            ).fetchone()
+        return row["result"] if row else None
+
+
+def set_llm_cache(db_path: str, capability: str, cache_key: str, result: str) -> None:
+    """Cache an LLM result without storing the original prompt."""
+    with get_connection(db_path) as conn:
+        conn.execute("""
+            INSERT INTO llm_cache (capability, cache_key, result)
+            VALUES (?, ?, ?)
+            ON CONFLICT(capability, cache_key) DO UPDATE SET
+                result = excluded.result, created_at = CURRENT_TIMESTAMP
+        """, (capability, cache_key, result))
+        conn.commit()
+
+
+def finish_llm_call(db_path: str, call_id: int, status: str,
+                    input_tokens: int = 0, output_tokens: int = 0,
+                    cost_usd: float = 0.0, error: Optional[str] = None,
+                    latency_ms: Optional[int] = None,
+                    response_data: Optional[Dict] = None) -> None:
+    """Finalize a reserved LLM call with actual usage and status."""
+    with get_connection(db_path) as conn:
+        conn.execute("""
+            UPDATE llm_calls SET status = ?, input_tokens = ?, output_tokens = ?,
+                cost_usd = ?, reserved_cost_usd = 0, error = ?, latency_ms = ?,
+                response_data = ? WHERE id = ?
+        """, (status, input_tokens, output_tokens, cost_usd, error, latency_ms,
+              json.dumps(response_data) if response_data else None, call_id))
+        conn.commit()
+
+
+def get_llm_budget(db_path: str, daily_budget_usd: float) -> Dict[str, Any]:
+    """Return today's actual, reserved, blocked, and remaining LLM budget."""
+    with get_connection(db_path) as conn:
+        row = conn.execute("""
+            SELECT COALESCE(SUM(cost_usd), 0) AS spent,
+                   COALESCE(SUM(reserved_cost_usd), 0) AS reserved,
+                   SUM(CASE WHEN status = 'blocked' THEN 1 ELSE 0 END) AS blocked,
+                   SUM(CASE WHEN status IN ('error', 'timeout') THEN 1 ELSE 0 END) AS failed
+            FROM llm_calls WHERE date(created_at) = date('now')
+        """).fetchone()
+    committed = row["spent"] or 0
+    reserved = row["reserved"] or 0
+    return {
+        "spent": committed,
+        "reserved": reserved,
+        "blocked": row["blocked"] or 0,
+        "failed": row["failed"] or 0,
+        "budget": daily_budget_usd,
+        "remaining": None if daily_budget_usd <= 0 else max(0, daily_budget_usd - committed - reserved),
+    }
+
+
+def reserve_zenrows_request(db_path: str, url: str, daily_limit: int,
+                            cooldown_hours: int = 24,
+                            force: bool = False) -> tuple[Optional[int], str]:
+    """Atomically reserve one ZenRows credit, enforcing cap and cooldown."""
+    with get_connection(db_path) as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        today = datetime.utcnow().date().isoformat()
+        used = conn.execute(
+            "SELECT COALESCE(SUM(cost_credits), 0) AS used FROM zenrows_usage "
+            "WHERE date(created_at) = ?", (today,)
+        ).fetchone()["used"]
+        if daily_limit >= 0 and used >= daily_limit:
+            return None, "daily ZenRows limit reached"
+
+        if not force:
+            recent = conn.execute(
+                "SELECT id FROM zenrows_usage WHERE url = ? AND success = 1 "
+                "AND created_at >= datetime('now', ?) ORDER BY id DESC LIMIT 1",
+                (url, f"-{cooldown_hours} hours"),
+            ).fetchone()
+            if recent:
+                return None, "ZenRows URL cooldown active"
+
+        cursor = conn.execute(
+            "INSERT INTO zenrows_usage (url, success, reason) VALUES (?, NULL, ?)",
+            (url, "reserved"),
+        )
+        conn.commit()
+        return cursor.lastrowid, "reserved"
+
+
+def finish_zenrows_request(db_path: str, usage_id: int, success: bool,
+                           status_code: int = 0, reason: str = "") -> None:
+    """Record the result of a reserved ZenRows request."""
+    with get_connection(db_path) as conn:
+        conn.execute(
+            "UPDATE zenrows_usage SET success = ?, status_code = ?, reason = ? WHERE id = ?",
+            (success, status_code, reason, usage_id),
+        )
+        conn.commit()
+
+
+def get_zenrows_usage(db_path: str, days: int = 1) -> Dict[str, Any]:
+    """Return ZenRows usage totals and recent request details."""
+    with get_connection(db_path) as conn:
+        since = datetime.utcnow() - timedelta(days=days)
+        row = conn.execute("""
+            SELECT COALESCE(SUM(cost_credits), 0) AS credits,
+                   COUNT(*) AS attempts,
+                   SUM(CASE WHEN success = 1 THEN 1 ELSE 0 END) AS successes,
+                   SUM(CASE WHEN success = 0 THEN 1 ELSE 0 END) AS failures
+            FROM zenrows_usage WHERE created_at >= ?
+        """, (since,)).fetchone()
+        return {
+            "credits": row["credits"] or 0,
+            "attempts": row["attempts"] or 0,
+            "successes": row["successes"] or 0,
+            "failures": row["failures"] or 0,
+        }
+
+
 def add_product(db_path: str, title: str, url: str, retailer: str, 
-                selector: Optional[str] = None, target_price: Optional[float] = None) -> int:
+                selector: Optional[str] = None, target_price: Optional[float] = None,
+                use_zenrows: bool = False) -> int:
     """Add a new product to track. Returns product ID."""
     with get_connection(db_path) as conn:
         cursor = conn.cursor()
@@ -175,14 +418,56 @@ def add_product(db_path: str, title: str, url: str, retailer: str,
         
         # Create product URL entry
         cursor.execute("""
-            INSERT INTO product_urls (product_id, url, retailer, selector, target_price)
-            VALUES (?, ?, ?, ?, ?)
-        """, (product_id, url, retailer, selector, target_price))
+            INSERT INTO product_urls (product_id, url, retailer, selector, target_price, use_zenrows)
+            VALUES (?, ?, ?, ?, ?, ?)
+        """, (product_id, url, retailer, selector, target_price, use_zenrows))
         
         log_activity(conn, "product_added", "product", product_id, {"url": url, "retailer": retailer})
         conn.commit()
         
         return product_id
+
+
+def update_product(db_path: str, product_id: int, title: Optional[str] = None,
+                   url: Optional[str] = None, retailer: Optional[str] = None) -> None:
+    """Update a product name and/or its tracked URL."""
+    with get_connection(db_path) as conn:
+        product = conn.execute(
+            "SELECT id FROM products WHERE id = ?", (product_id,)
+        ).fetchone()
+        if not product:
+            raise ValueError("product not found")
+
+        if title is not None:
+            title = title.strip()
+            if not title:
+                raise ValueError("title must not be empty")
+            conn.execute(
+                "UPDATE products SET title = ?, updated_at = ? WHERE id = ?",
+                (title, datetime.utcnow(), product_id),
+            )
+
+        if url is not None or retailer is not None:
+            row = conn.execute(
+                "SELECT id FROM product_urls WHERE product_id = ? ORDER BY id LIMIT 1",
+                (product_id,),
+            ).fetchone()
+            if not row:
+                raise ValueError("product has no tracked URL")
+            allowed = {"url", "retailer"}
+            data = {"url": url, "retailer": retailer}
+            fields = [f"{k} = ?" for k in data.keys() if k in allowed and data[k] is not None]
+            values = [data[k] for k in allowed if k in data and data[k] is not None]
+            values.append(row["id"])
+            conn.execute(
+                f"UPDATE product_urls SET {', '.join(fields)} WHERE id = ?",
+                values,
+            )
+            conn.execute(
+                "UPDATE products SET updated_at = ? WHERE id = ?",
+                (datetime.utcnow(), product_id),
+            )
+        conn.commit()
 
 
 def get_products(db_path: str) -> List[Dict[str, Any]]:
@@ -192,7 +477,7 @@ def get_products(db_path: str) -> List[Dict[str, Any]]:
         cursor.execute("""
             SELECT p.id, p.title, p.created_at,
                    pu.id as url_id, pu.url, pu.retailer, pu.selector,
-                   pu.target_price, pu.glitch_watch, pu.last_checked,
+                   pu.target_price, pu.use_zenrows, pu.glitch_watch, pu.last_checked,
                    pu.last_price, pu.last_status, pu.error
             FROM products p
             LEFT JOIN product_urls pu ON p.id = pu.product_id
@@ -217,6 +502,7 @@ def get_products(db_path: str) -> List[Dict[str, Any]]:
                     "retailer": row["retailer"],
                     "selector": row["selector"],
                     "target_price": row["target_price"],
+                    "use_zenrows": bool(row["use_zenrows"]),
                     "glitch_watch": bool(row["glitch_watch"]),
                     "last_checked": row["last_checked"],
                     "last_price": row["last_price"],
@@ -281,6 +567,25 @@ def create_alert(db_path: str, url_id: int, alert_type: str, title: str,
         return alert_id
 
 
+def claim_alert_condition(db_path: str, url_id: int, alert_type: str,
+                          active: bool) -> bool:
+    """Return whether an alert should be emitted for a condition transition."""
+    with get_connection(db_path) as conn:
+        row = conn.execute(
+            "SELECT active FROM alert_conditions WHERE product_url_id = ? AND alert_type = ?",
+            (url_id, alert_type),
+        ).fetchone()
+        was_active = bool(row["active"]) if row else False
+        conn.execute("""
+            INSERT INTO alert_conditions (product_url_id, alert_type, active, updated_at)
+            VALUES (?, ?, ?, ?)
+            ON CONFLICT(product_url_id, alert_type) DO UPDATE SET
+                active = excluded.active, updated_at = excluded.updated_at
+        """, (url_id, alert_type, active, datetime.utcnow()))
+        conn.commit()
+        return active and not was_active
+
+
 def get_alerts(db_path: str, unread_only: bool = False, limit: int = 100) -> List[Dict[str, Any]]:
     """Get alerts, optionally filtered to unread only."""
     with get_connection(db_path) as conn:
@@ -307,6 +612,13 @@ def mark_alert_read(db_path: str, alert_id: int) -> None:
     """Mark an alert as read."""
     with get_connection(db_path) as conn:
         conn.execute("UPDATE alerts SET read = TRUE WHERE id = ?", (alert_id,))
+        conn.commit()
+
+
+def mark_alert_sent(db_path: str, alert_id: int) -> None:
+    """Mark an alert as successfully delivered by push notification."""
+    with get_connection(db_path) as conn:
+        conn.execute("UPDATE alerts SET sent_push = TRUE WHERE id = ?", (alert_id,))
         conn.commit()
 
 
@@ -357,6 +669,26 @@ def add_feed_item(db_path: str, feed_id: int, item_id: str, title: str,
         
         conn.commit()
         return cursor.lastrowid
+
+
+def get_feed_item(db_path: str, feed_id: int, item_id: str) -> Optional[Dict[str, Any]]:
+    """Return a feed item by its feed-local identifier."""
+    with get_connection(db_path) as conn:
+        row = conn.execute(
+            "SELECT * FROM feed_items WHERE feed_id = ? AND item_id = ?",
+            (feed_id, item_id),
+        ).fetchone()
+        return dict(row) if row else None
+
+
+def mark_feed_item_triaged(db_path: str, item_id: int, result: Dict[str, Any]) -> None:
+    """Persist a feed item's triage result."""
+    with get_connection(db_path) as conn:
+        conn.execute(
+            "UPDATE feed_items SET triaged = TRUE, triage_result = ? WHERE id = ?",
+            (json.dumps(result), item_id),
+        )
+        conn.commit()
 
 
 def get_feed_items(db_path: str, feed_id: Optional[int] = None, 
